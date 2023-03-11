@@ -1,5 +1,6 @@
 import abc
 import os, sys
+import time
 import argparse
 import torch
 import evaluate
@@ -11,6 +12,10 @@ from collections import defaultdict
 from torch.utils.data import DataLoader
 from transformers import (
     BartForConditionalGeneration,
+    MBartTokenizer, 
+    GPT2Tokenizer, 
+    GPT2LMHeadModel, 
+    T5ForConditionalGeneration, 
     AdamW,
     AutoConfig,
     AutoModel,
@@ -64,6 +69,7 @@ class ModelTrainTemplate(pl.LightningModule):
     DEFAULT_MODEL_MODE = "sequence-classification"
     DEFAULT_VAL_METRIC = "accuracy"
     ROUGE_KEYS = ["rouge1", "rouge2", "rougeL"]
+    GLUE_TASKS = ['mrpc', ]
 
     def __init__(
         self,
@@ -138,17 +144,17 @@ class ModelTrainTemplate(pl.LightningModule):
     def _initialize_metric(self):
         self.loss_names = ["loss"]
         self.metrics_save_path = os.path.join(self.output_dir, "metrics.json")
-        if self.hparams.model_mode == 'summarization':
+        if self.is_seq2seq:
             self.metric_names = ModelTrainTemplate.ROUGE_KEYS
+            self.metric = evaluate.load("rouge")
         elif self.hparams.model_mode == 'sequence-classification':
             self.metric_names = ['accuracy', ]
-            if self.hparams.task is not None:
+            if self.hparams.task in ModelTrainTemplate.GLUE_TASKS:
                 self.metric = evaluate.load("glue", self.hparams.task)
             else:
                 self.metric = evaluate.load("accuracy")
         self.metrics = defaultdict(list)
         self.val_metric_name = ModelTrainTemplate.DEFAULT_VAL_METRIC if self.hparams.val_metric is None else self.hparams.val_metric
-        self.log_val_metric = 'accuracy'
         self.training_loss_across_batches_at_curr_epoch = []
 
     def _get_model_from_argparse_args(
@@ -185,14 +191,12 @@ class ModelTrainTemplate(pl.LightningModule):
                 cache_dir=self.hparams.cache_dir,
             )
 
-        use_task_specific_params(model, self.hparams.task)
+        use_task_specific_params(model, self.task_specific_name)
 
         return config, tokenizer, model
 
     def _task_specific_parameter_setting(self):
-        seq2seq_models = ["summarization", "translation"]
-
-        if self.hparams.model_mode in seq2seq_models:
+        if self.is_seq2seq:
             self.decoder_start_token_id = None  # default to config
             self.eval_max_length = 62
             self.eval_min_length = 11
@@ -208,15 +212,18 @@ class ModelTrainTemplate(pl.LightningModule):
             assert self.target_lens["train"] <= self.target_lens["val"], f"target_lens: {self.target_lens}"
             assert self.target_lens["train"] <= self.target_lens["test"], f"target_lens: {self.target_lens}"
             
-            extra_model_params = ("encoder_layerdrop", "decoder_layerdrop", "dropout", "attention_dropout")
-            for p in extra_model_params:
-                if getattr(self.hparams, p, None):
-                    assert hasattr(self.config, p), f"model config doesn't have a `{p}` attribute"
-                    setattr(self.config, p, getattr(self.hparams, p))
+            if isinstance(self.model, BartForConditionalGeneration):
+                extra_model_params = ("encoder_layerdrop", "decoder_layerdrop", "dropout", "attention_dropout")
+                for p in extra_model_params:
+                    if getattr(self.hparams, p, None):
+                        assert hasattr(self.config, p), f"model config doesn't have a `{p}` attribute"
+                        setattr(self.config, p, getattr(self.hparams, p))
 
             if self.model.config.decoder_start_token_id is None and isinstance(self.tokenizer, MBartTokenizer):
                 self.decoder_start_token_id = self.tokenizer.lang_code_to_id[hparams.tgt_lang]
                 self.model.config.decoder_start_token_id = self.decoder_start_token_id
+            else:
+                self.decoder_start_token_id = self.model.config.decoder_start_token_id
 
             self.eval_beams = self.model.config.num_beams if self.hparams.eval_beams is None else self.hparams.eval_beams
             assert self.eval_beams >= 1, f"got self.eval_beams={self.eval_beams}. Need an integer > 1"
@@ -247,6 +254,12 @@ class ModelTrainTemplate(pl.LightningModule):
     def is_seq2seq(self) -> bool:
         seq2seq = ["summarization", "translation"]
         return self.hparams.model_mode in seq2seq
+
+    @property
+    def task_specific_name(self) -> str:
+        if self.is_seq2seq:
+            return 'text-generation'
+        return None
 
     def _get_lr_scheduler(self):
         arg_to_scheduler = get_scheduler_info()['arg_to_scheduler']
@@ -372,21 +385,23 @@ class ModelTrainTemplate(pl.LightningModule):
         src_ids, src_mask = batch["input_ids"], batch["attention_mask"]
         tgt_ids = batch["labels"]
 
-        if self.hparams.model_mode == 'seq2seq':
+        if self.is_seq2seq:
             if isinstance(self.model, T5ForConditionalGeneration):
                 decoder_input_ids = self.model._shift_right(tgt_ids)
             else:
-                decoder_input_ids = shift_tokens_right(tgt_ids, pad_token_id)
+                decoder_input_ids = shift_tokens_right(tgt_ids, pad_token_id, \
+                                        decoder_start_token_id=self.decoder_start_token_id)
 
             # outputs = self(src_ids, attention_mask=src_mask, decoder_input_ids=decoder_input_ids, use_cache=False,
             #                use_prefix=True, return_dict=True, labels=tgt_ids)
             #
             # return (outputs.loss,)
 
-            outputs = self(src_ids, attention_mask=src_mask, decoder_input_ids=decoder_input_ids, use_cache=False,
-                        use_prefix=True)
+            outputs = self(src_ids, attention_mask=src_mask, decoder_input_ids=decoder_input_ids, use_cache=False,)
+                        # use_prefix=True)
 
-            lm_logits = outputs[0]
+            lm_logits = outputs['logits']
+            
             if self.hparams.label_smoothing == 0:
                 # Same behavior as modeling_bart.py, besides ignoring pad_token_id
                 ce_loss_fct = torch.nn.CrossEntropyLoss(ignore_index=pad_token_id)
@@ -414,7 +429,7 @@ class ModelTrainTemplate(pl.LightningModule):
     def training_step(self, batch, batch_idx) -> Dict:
         loss_tensors = self._step(batch)
 
-        if self.hparams.model_mode == 'seq2seq':
+        if self.is_seq2seq:
             logs = {name: loss for name, loss in zip(self.loss_names, loss_tensors)}
             # tokens per batch
             logs["tpb"] = batch["input_ids"].ne(self.pad).sum() + batch["labels"].ne(self.pad).sum()
@@ -479,9 +494,9 @@ class ModelTrainTemplate(pl.LightningModule):
         preds = flatten_list([x["preds"] for x in outputs])
         
         """ log after epoch end. """
-        eval_metric = self.metric.compute()
-        log_val_metric = 'loss' if self.log_val_metric is None else self.log_val_metric
-        self.log('val_{}'.format(self.val_metric_name), float(eval_metric[log_val_metric]))
+        metric_kwargs = dict(use_stemmer=True) if self.is_seq2seq else dict()
+        eval_metric = self.metric.compute(**metric_kwargs)
+        self.log('val_{}'.format(self.val_metric_name), float(eval_metric[self.val_metric_name]))
 
         return all_metrics
 
@@ -491,26 +506,14 @@ class ModelTrainTemplate(pl.LightningModule):
 
     """ for seq2seq model """
     def calc_generative_metrics(self, preds, target) -> Dict:
-        return calculate_rouge(preds, target)
+        return calculate_rouge(preds, target, rouge_keys=ModelTrainTemplate.ROUGE_KEYS)
         # return calculate_bleu(preds, target)
 
     def _inference_step(self, batch: dict) -> dict:
         bsz = batch["input_ids"].size(0)
-
-        if self.hparams.model_mode == 'seq2seq':
+        if self.is_seq2seq:
             t0 = time.time()
-            generated_ids = self.model.generate(
-                batch["input_ids"],
-                past_key_values=None,
-                attention_mask=batch["attention_mask"],
-                use_cache=True,
-                length_penalty=self.hparams.length_penalty,
-                use_prefix=True,
-                decoder_start_token_id=self.decoder_start_token_id,
-                num_beams=self.eval_beams,
-                min_length=self.eval_min_length,
-                max_length=self.eval_max_length,
-            )
+            generated_ids = self._generate_output_ids(batch)
             gen_time = (time.time() - t0) / batch["input_ids"].shape[0]
             preds: List[str] = self.ids_to_clean_text(generated_ids)
             target: List[str] = self.ids_to_clean_text(batch["labels"])
@@ -519,7 +522,6 @@ class ModelTrainTemplate(pl.LightningModule):
             # print('INPUT:', self.ids_to_clean_text(batch["input_ids"]))
             # print(preds, target)
             rouge: Dict = self.calc_generative_metrics(preds, target)
-            self.log('val_{}'.format(self.val_metric_name), float(rouge['rouge2']))
             summ_len = np.mean(lmap(len, generated_ids))
             base_metrics.update(gen_time=gen_time, gen_len=summ_len, preds=preds, target=target, **rouge)
         
@@ -530,11 +532,46 @@ class ModelTrainTemplate(pl.LightningModule):
             loss_tensors = self._step(batch)
             base_metrics = {name: loss for name, loss in zip(self.loss_names, loss_tensors)}
             batch_acc = sum([1 if p == t else 0 for p, t in zip(preds, target)]) / bsz
-            self.metric.add_batch(predictions=preds, references=target)
-            # self.log('val_{}'.format(self.val_metric), float())
             base_metrics.update(accuracy=batch_acc, preds=preds.tolist(), target=target.tolist())
 
+        self.metric.add_batch(predictions=preds, references=target)
+
         return base_metrics
+
+    def _generate_output_ids(self, batch: dict):
+        seq2seq_model_type = (BartForConditionalGeneration, GPT2LMHeadModel, )
+        if isinstance(self.model, GPT2LMHeadModel):
+            # todo: set gpt parameters
+            output_sequences = self.model.generate(
+                input_ids=batch["input_ids"],
+                emb_match=None,
+                control_code=control_code,
+                max_length=args.length + len(encoded_prompt[0]),
+                temperature=args.temperature,
+                top_k=args.k,
+                top_p=0.8,
+                eos_token_id=tokenizer.eos_token_id,
+                repetition_penalty=args.repetition_penalty,
+                do_sample=True,
+                num_return_sequences=args.num_return_sequences,
+            )
+        elif isinstance(self.model, BartForConditionalGeneration): 
+            output_sequences = self.model.generate(
+                batch["input_ids"],
+                # past_key_values=None,
+                attention_mask=batch["attention_mask"],
+                use_cache=True,
+                length_penalty=self.hparams.length_penalty,
+                # use_prefix=True,
+                decoder_start_token_id=self.decoder_start_token_id,
+                num_beams=self.eval_beams,
+                min_length=self.eval_min_length,
+                max_length=self.eval_max_length,
+            )
+        else: 
+            assert isinstance(self.model, seq2seq_model_type)
+
+        return output_sequences
 
     """ save and load """
 

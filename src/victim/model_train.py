@@ -78,7 +78,8 @@ def parse_args() -> List[Namespace]:
     parser.add_argument('--length_pen', type=float, default=1.0, help='')
     parser.add_argument('--use_deep', type=str, default='no', help='')
     parser.add_argument('--mid_dim', type=int, default=512, help='')
-      
+
+    parser.add_argument('--use_task_specific_params', action='store_true', help='') 
     parser.add_argument(
         '--task_specific_params', 
         type=str, 
@@ -91,6 +92,8 @@ def parse_args() -> List[Namespace]:
     parser.add_argument('--max_target_length', type=int, default=1024, help='')
     parser.add_argument('--val_max_target_length', type=int, default=1024, help='')
     parser.add_argument('--test_max_target_length', type=int, default=1024, help='')
+    parser.add_argument('--eval_max_gen_length', type=int, default=1024, help='')
+    parser.add_argument("--length_penalty", type=float, default=1.0, help="never generate more than n tokens")
     parser.add_argument("--sortish_sampler", action="store_true", default=False)
     parser.add_argument('--train_batch_size', type=int, default=10, help='')
     parser.add_argument('--eval_batch_size', type=int, default=10, help='')
@@ -151,7 +154,10 @@ def parse_args() -> List[Namespace]:
 
 
     args = parser.parse_args()
-    args.task_specific_params = json.loads(args.task_specific_params) 
+    if args.use_task_specific_params:
+        args.task_specific_params = json.loads(args.task_specific_params)
+    else:
+        delattr(args, 'task_specific_params')
     args = split_args(args)
 
     return args
@@ -172,7 +178,7 @@ def split_args(args):
         'gradient_accumulation_steps', 'num_train_epochs', 
     ]
     model_args = [
-        'task_specific_params'
+        'task_specific_params', 
     ]
     module_args = [
         'model_name_or_path', 'cache_dir', 'config_name', 'tokenizer_name', 'num_labels', 'max_source_length', 
@@ -180,8 +186,8 @@ def split_args(args):
         'num_workers', 'n_train', 'n_val', 'n_test', 'use_big', 'adafactor', 'adam_epsilon', 'use_dropout', 
         'max_steps', 'eval_steps', 'warmup_steps', 'learning_rate', 'weight_decay', 
         'dropout', 'label_smoothing', 'max_grad_norm', 'lr_scheduler', 
-        'data_dir', 'eval_beams', 'src_lang', 'tgt_lang',
-        'max_target_length', 'val_max_target_length', 'test_max_target_length',
+        'data_dir', 'eval_beams', 'src_lang', 'tgt_lang', 'length_penalty', 
+        'max_target_length', 'val_max_target_length', 'test_max_target_length', 'eval_max_gen_length', 
     ]
     args_dict = vars(args)
     new_args = argparse.Namespace()
@@ -228,6 +234,8 @@ def main(args):
     check_argument_setting(args.main, 'model_mode')
     dataset_cls = ( VictimTrainDataset )
     model_tmp = ModelTrainTemplate(args.module, dataset_cls=dataset_cls, **vars(args.model))
+    
+    # a = model_tmp.validation_step([ x for i, x in enumerate(model_tmp._get_dataloader('train', 10)) if i == 0][0], batch_idx=0)
     
     logger = get_logger(args.main)
     output_dir = model_tmp.output_dir
@@ -290,6 +298,8 @@ def main(args):
 
     if args.main.do_train:
         trainer.fit(model_tmp)
+
+    result = trainer.test(model_tmp)
 
     import pdb
     pdb.set_trace()

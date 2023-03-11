@@ -11,6 +11,7 @@ from functools import cached_property
 from typing import Callable, Dict, Iterable, List, Union
 from pathlib import Path
 from torch.utils.data import Dataset, Sampler
+from rouge_score import rouge_scorer, scoring
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.utilities import rank_zero_only
 from transformers import (
@@ -432,8 +433,8 @@ def lmap(f: Callable, x: Iterable) -> List:
 def flatten_list(summary_ids: List[List]):
     return [x for x in itertools.chain.from_iterable(summary_ids)]
 
-def calculate_rouge(output_lns: List[str], reference_lns: List[str], use_stemmer=True) -> Dict:
-    scorer = rouge_scorer.RougeScorer(ROUGE_KEYS, use_stemmer=use_stemmer)
+def calculate_rouge(output_lns: List[str], reference_lns: List[str], rouge_keys: List[str], use_stemmer=True) -> Dict:
+    scorer = rouge_scorer.RougeScorer(rouge_keys, use_stemmer=use_stemmer)
     aggregator = scoring.BootstrapAggregator()
 
     for reference_ln, output_ln in zip(reference_lns, output_lns):
@@ -454,15 +455,16 @@ def pickle_save(obj, path):
     with open(path, "wb") as f:
         return pickle.dump(obj, f)
 
-def use_task_specific_params(model, task):
+def use_task_specific_params(model, task=None):
     """Update config with summarization specific params."""
-    task_specific_params = model.config.task_specific_params
+    if task is not None:
+        task_specific_params = model.config.task_specific_params
 
-    if task_specific_params is not None:
-        pars = task_specific_params.get(task, {})
-        check_task_specific_params_type(pars)
-        print(f"using task specific params for {task}: {pars}")
-        model.config.update(pars)
+        if task_specific_params is not None:
+            pars = task_specific_params.get(task, {})
+            check_task_specific_params_type(pars)
+            print(f"using task specific params for {task}: {pars}")
+            model.config.update(pars)
 
 def check_task_specific_params_type(pars):
     int_params = ['num_labels']
@@ -491,14 +493,14 @@ def load_json(path):
 
 def check_argument_setting(args, arg_name):
     if arg_name == 'task':
-        assert args.task in ['agnews', 'mrpc']
+        assert args.task in ['agnews', 'mrpc', 'news-summary']
     elif arg_name == 'model_mode':
         assert args.model_mode in ['base', 'sequence-classification', 'question-answering', \
             'pretraining', 'token-classification', 'language-modeling', \
             'summarization', 'translation']
 
 def check_variable_status(variable, name="", status='None'):
-    if status is 'None':
+    if status == 'None':
         if variable is None:
             raise ValueError('{} parameter should not be none. '.format(name))
 
